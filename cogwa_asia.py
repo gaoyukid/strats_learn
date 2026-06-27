@@ -99,7 +99,7 @@ class COGWA_Asia:
         self.tenor_iv_cache[tenor_idx] = (x_fine, iv_smooth)
         return x_fine, iv_smooth
 
-    def get_iv(self, T, delta, svi_params=None):
+    def get_iv(self, T, delta, S0, K, svi_params=None):
         """
         Piecewise hybrid volatility interpolation logic:
         - |delta| < 0.7: Regularized COGWA cubic interpolation
@@ -120,7 +120,8 @@ class COGWA_Asia:
         if svi_params is None:
             return np.interp(delta, x_fine, iv_smooth)
         a,b,rho,m,sigma = svi_params
-        k = np.log(np.clip(delta, -0.99, 0.99))
+        # 修复：SVI模型正确的对数执行价计算 k=ln(K/S0)，无负数对数问题
+        k = np.log(K / S0)
         vol_tail = svi_iv(k, a,b,rho,m,sigma)
         return vol_tail
 
@@ -155,8 +156,8 @@ T_target = 1.0
 delta_target = -0.9
 K_target = 4500
 
-# Fetch hybrid COGWA tail volatility and compute option price
-cogwa_vol = cogwa_asia.get_iv(T_target, delta_target, svi_params)
+# Fetch hybrid COGWA tail volatility and compute option price（传入S0和K_target修复参数）
+cogwa_vol = cogwa_asia.get_iv(T_target, delta_target, S0, K_target, svi_params)
 price_cogwa = bs_price(S0, K_target, T_target, r_ms, q, cogwa_vol)
 
 # Benchmark: Pure SVI volatility pricing for comparison
