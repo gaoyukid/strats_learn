@@ -1,8 +1,15 @@
 import logging
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 import numpy as np
 from scipy.interpolate import interp1d
 from scipy.optimize import minimize
 from scipy.stats import norm
+
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # -------------------------- Logging Initialization --------------------------
 logging.basicConfig(
@@ -13,8 +20,8 @@ logging.basicConfig(
 logger = logging.getLogger("COGWA_Asia_Vol_Model")
 
 # ===================== 1. Black‑Scholes Pricing Formula =====================
-def bs_price(S, K, T, r, q, sigma):
-    logger.debug(f"BS input -> S={S}, K={K}, T={T:.4f}, r={r:.4f}, q={q:.4f}, sigma={sigma:.6f}")
+def bs_price(S, K, T, r, q, sigma, option_type='call'):
+    logger.debug(f"BS input -> S={S}, K={K}, T={T:.4f}, r={r:.4f}, q={q:.4f}, sigma={sigma:.6f}, option_type={option_type}")
     
     # Guard against invalid volatility / maturity
     if sigma <= 1e-8:
@@ -27,6 +34,11 @@ def bs_price(S, K, T, r, q, sigma):
     d1 = (np.log(S/K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
     c = S * np.exp(-q*T) * norm.cdf(d1) - K * np.exp(-r*T) * norm.cdf(d2)
+
+    if option_type.lower() == 'put':
+        p = c - S * np.exp(-q*T) + K * np.exp(-r*T)
+        logger.debug(f"BS result -> d1={d1:.6f}, d2={d2:.6f}, option_price={p:.4f}")
+        return p
 
     logger.debug(f"BS result -> d1={d1:.6f}, d2={d2:.6f}, option_price={c:.4f}")
     return c
@@ -192,61 +204,236 @@ class COGWA_Asia:
         logger.info(f"Deep OTM tail, SSVI extrapolated vol={vol_tail:.6f}")
         return vol_tail
 
-# ===================== 4. Calibration Parameters for Asia Market (HSI/A50 Style Benchmark) =====================
-logger.info("========== Start COGWA Asia Demo Calibration ==========")
-S0 = 5000
-q = 0.015
-r_public = 0.045
-r_ms = 0.0485
-logger.debug(f"Market static params: S0={S0}, div q={q:.4f}, r_public={r_public:.4f}, r_ms={r_ms:.4f}")
+def build_default_model():
+    logger.info("Build default COGWA Asia pricing model")
+    tenors = [0.25, 1.0]
+    deltas = [-0.9, -0.25, 0, 0.25, 0.9]
+    raw_iv = np.array([
+        [0.26, 0.21, 0.19, 0.20, 0.285],
+        [0.24, 0.20, 0.18, 0.19, 0.25]
+    ])
+    bid_ask_spread = np.array([
+        [0.08, 0.03, 0.02, 0.03, 0.10],
+        [0.07, 0.02, 0.02, 0.03, 0.09]
+    ])
+    svi_params = (0.012, 0.12, -0.65, 0.0, 0.22)
+    model = COGWA_Asia(tenors, deltas, raw_iv, bid_ask_spread)
+    return model, svi_params
 
-# Maturity tenors: 3-month / 1-year (typical liquidity gap structure in Asia equity derivatives)
-tenors = [0.25, 1.0]
-deltas = [-0.9, -0.25, 0, 0.25, 0.9]
-logger.debug(f"Tenor list: {tenors}, delta grid: {deltas}")
 
-# Raw noisy implied volatility surface + wide bid-ask spreads simulating Asia market liquidity
-raw_iv = np.array([
-    [0.26, 0.21, 0.19, 0.20, 0.285],
-    [0.24, 0.20, 0.18, 0.19, 0.25]
-])
-bid_ask_spread = np.array([
-    [0.08, 0.03, 0.02, 0.03, 0.10],
-    [0.07, 0.02, 0.02, 0.03, 0.09]
-])
-logger.debug(f"Raw IV surface shape={raw_iv.shape}, bid-ask spread shape={bid_ask_spread.shape}")
+def price_hybrid_option(model, T, delta, S0, K, q, r, option_type, svi_params):
+    vol = model.get_iv(T, delta, S0, K, svi_params)
+    price = bs_price(S0, K, T, r, q, vol, option_type=option_type)
+    return vol, price
 
-# SVI constant parameters for deep OTM tail extrapolation
-svi_params = (0.012, 0.12, -0.65, 0.0, 0.22)
-logger.debug(f"Global SVI tail params: {svi_params}")
 
-# Initialize Asia-Pacific COGWA volatility model instance
-logger.info("Create COGWA_Asia instance")
-cogwa_asia = COGWA_Asia(tenors, deltas, raw_iv, bid_ask_spread)
+def price_pure_svi(S0, K, T, q, r, option_type, svi_params):
+    k = np.log(K / S0)
+    vol = svi_iv(k, *svi_params)
+    price = bs_price(S0, K, T, r, q, vol, option_type=option_type)
+    return vol, price
 
-# Pricing target: 1-year 90Δ deep OTM put option
-T_target = 1.0
-delta_target = -0.9
-K_target = 4500
-logger.info(f"Pricing target: T={T_target}, delta={delta_target}, strike K={K_target}")
 
-# Fetch hybrid COGWA tail volatility and compute option price
-logger.info("Call get_iv for COGWA hybrid volatility")
-cogwa_vol = cogwa_asia.get_iv(T_target, delta_target, S0, K_target, svi_params)
-logger.info("Calculate COGWA hybrid option price via BS")
-price_cogwa = bs_price(S0, K_target, T_target, r_ms, q, cogwa_vol)
+def parse_float(value, default=None):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-# Benchmark: Pure SVI volatility pricing for comparison
-logger.info("Calculate pure SVI benchmark volatility")
-k = np.log(K_target/S0)
-svi_vol = svi_iv(k, *svi_params)
-logger.info("Calculate pure SVI benchmark option price via BS")
-price_svi = bs_price(S0, K_target, T_target, r_public, q, svi_vol)
 
-# Print output comparison results
-logger.info("========== Final Pricing Comparison Output ==========")
-print(f"COGWA‑Asia Hybrid Tail Volatility: {cogwa_vol:.4f}")
-print(f"Pure SVI Fitted Volatility:        {svi_vol:.4f}")
-print(f"COGWA‑Asia Prop Desk Price:         {price_cogwa:.2f}")
-print(f"SVI Price (Public Discount Rate):   {price_svi:.2f}")
-logger.info("========== COGWA Demo Execution Finished ==========")
+class COGWAAsiaPricingUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("COGWA Asia Option Pricing")
+        self.model, self.svi_params = build_default_model()
+        self.history = []
+
+        self._build_widgets()
+        self._set_default_inputs()
+        self._update_chart()
+
+    def _build_widgets(self):
+        frame = ttk.Frame(self.root, padding=12)
+        frame.grid(row=0, column=0, sticky="nsew")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        row = 0
+        for label_text, var_name in [
+            ("Spot price (S0)", "spot"),
+            ("Strike price (K)", "strike"),
+            ("Time to maturity (years)", "maturity"),
+            ("Delta", "delta"),
+            ("Dividend yield (q)", "div"),
+            ("Desk discount rate (r desk)", "r_desk"),
+            ("Public discount rate (r public)", "r_public")
+        ]:
+            ttk.Label(frame, text=label_text).grid(row=row, column=0, sticky="w", pady=4)
+            entry = ttk.Entry(frame, width=18)
+            entry.grid(row=row, column=1, sticky="ew", pady=4)
+            setattr(self, f"entry_{var_name}", entry)
+            row += 1
+
+        ttk.Label(frame, text="Option type").grid(row=row, column=0, sticky="w", pady=4)
+        self.option_type = ttk.Combobox(frame, values=["call", "put"], state="readonly", width=16)
+        self.option_type.grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Button(frame, text="Price Option", command=self.on_price).grid(row=row, column=0, pady=12)
+        ttk.Button(frame, text="Save History", command=self.save_history_csv).grid(row=row, column=1, pady=12)
+        row += 1
+
+        separator = ttk.Separator(frame, orient="horizontal")
+        separator.grid(row=row, column=0, columnspan=2, sticky="ew", pady=8)
+        row += 1
+
+        self.result_text = tk.Text(frame, width=48, height=8, wrap="word", state="disabled")
+        self.result_text.grid(row=row, column=0, columnspan=2, sticky="nsew")
+        row += 1
+
+        chart_frame = ttk.Frame(frame)
+        chart_frame.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=8)
+        frame.rowconfigure(row, weight=1)
+
+        self.figure = Figure(figsize=(6, 3), dpi=100)
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_title("Pricing History")
+        self.ax.set_xlabel("Run")
+        self.ax.set_ylabel("Price")
+        self.ax.grid(True)
+
+        self.canvas = FigureCanvasTkAgg(self.figure, master=chart_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _set_default_inputs(self):
+        self.entry_spot.insert(0, "5000")
+        self.entry_strike.insert(0, "4500")
+        self.entry_maturity.insert(0, "1.0")
+        self.entry_delta.insert(0, "-0.9")
+        self.entry_div.insert(0, "0.015")
+        self.entry_r_desk.insert(0, "0.0485")
+        self.entry_r_public.insert(0, "0.045")
+        self.option_type.set("put")
+
+    def on_price(self):
+        inputs = {
+            "spot": parse_float(self.entry_spot.get()),
+            "strike": parse_float(self.entry_strike.get()),
+            "maturity": parse_float(self.entry_maturity.get()),
+            "delta": parse_float(self.entry_delta.get()),
+            "div": parse_float(self.entry_div.get()),
+            "r_desk": parse_float(self.entry_r_desk.get()),
+            "r_public": parse_float(self.entry_r_public.get())
+        }
+
+        if any(value is None for value in inputs.values()):
+            messagebox.showerror("Input error", "Please enter valid numeric values in all fields.")
+            return
+
+        option_type = self.option_type.get().lower()
+        if option_type not in ["call", "put"]:
+            messagebox.showerror("Input error", "Option type must be 'call' or 'put'.")
+            return
+
+        hybrid_vol, hybrid_price = price_hybrid_option(
+            self.model,
+            inputs["maturity"],
+            inputs["delta"],
+            inputs["spot"],
+            inputs["strike"],
+            inputs["div"],
+            inputs["r_desk"],
+            option_type,
+            self.svi_params
+        )
+
+        svi_vol, svi_price = price_pure_svi(
+            inputs["spot"],
+            inputs["strike"],
+            inputs["maturity"],
+            inputs["div"],
+            inputs["r_public"],
+            option_type,
+            self.svi_params
+        )
+
+        output = (
+            f"COGWA-Asia Hybrid Volatility: {hybrid_vol:.4f}\n"
+            f"COGWA-Asia Hybrid Price:      {hybrid_price:.2f}\n"
+            f"Pure SVI Volatility:          {svi_vol:.4f}\n"
+            f"Pure SVI Price:               {svi_price:.2f}\n"
+            f"Nearest tenor used:           {self.model.tenors[np.argmin(np.abs(self.model.tenors - inputs['maturity']))]:.2f} years\n"
+            f"SVI tail parameters:          {self.svi_params}\n"
+        )
+
+        self.history.append({
+            "run": len(self.history) + 1,
+            "spot": inputs["spot"],
+            "strike": inputs["strike"],
+            "maturity": inputs["maturity"],
+            "delta": inputs["delta"],
+            "option_type": option_type,
+            "hybrid_vol": hybrid_vol,
+            "hybrid_price": hybrid_price,
+            "svi_vol": svi_vol,
+            "svi_price": svi_price
+        })
+        self._display_result(output)
+        self._update_chart()
+
+    def _display_result(self, text):
+        self.result_text.configure(state="normal")
+        self.result_text.delete("1.0", tk.END)
+        self.result_text.insert(tk.END, text)
+        self.result_text.configure(state="disabled")
+
+    def _update_chart(self):
+        self.ax.clear()
+        self.ax.set_title("Pricing History")
+        self.ax.set_xlabel("Run")
+        self.ax.set_ylabel("Price")
+        self.ax.grid(True)
+
+        if self.history:
+            runs = [entry["run"] for entry in self.history]
+            hybrid_prices = [entry["hybrid_price"] for entry in self.history]
+            svi_prices = [entry["svi_price"] for entry in self.history]
+            self.ax.plot(runs, hybrid_prices, marker="o", label="Hybrid Price")
+            self.ax.plot(runs, svi_prices, marker="s", label="Pure SVI Price")
+            self.ax.legend()
+        else:
+            self.ax.text(0.5, 0.5, "No pricing history yet.", ha="center", va="center", transform=self.ax.transAxes)
+
+        self.canvas.draw()
+
+    def save_history_csv(self):
+        if not self.history:
+            messagebox.showinfo("Save history", "No pricing history to save.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Save pricing history"
+        )
+        if not file_path:
+            return
+
+        import csv
+        with open(file_path, mode="w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=[
+                "run", "spot", "strike", "maturity", "delta", "option_type",
+                "hybrid_vol", "hybrid_price", "svi_vol", "svi_price"
+            ])
+            writer.writeheader()
+            for row in self.history:
+                writer.writerow(row)
+
+        messagebox.showinfo("Save history", f"Pricing history saved to {file_path}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = COGWAAsiaPricingUI(root)
+    root.mainloop()
